@@ -9,15 +9,14 @@ import pox.openflow.libopenflow_01 as of
 from pox.lib.addresses import IPAddr, EthAddr
 import pox.lib.packet as pkt
 
-log = core.getLogger()
+log = core.getLogger("")
 
-# Server IPs and MACs (h5 and h6)
 SERVERS = [
     {"ip": IPAddr("10.0.0.5"), "mac": EthAddr("00:00:00:00:00:05")},
     {"ip": IPAddr("10.0.0.6"), "mac": EthAddr("00:00:00:00:00:06")},
 ]
 
-server_index = 0  # Round-robin tracker
+server_index = 0
 
 class SDNLoadBalancer(object):
     def __init__(self, connection):
@@ -25,16 +24,20 @@ class SDNLoadBalancer(object):
         connection.addListeners(self)
         log.info("Load balancer initialized on switch %s", connection)
 
-        self.client_mac_cache = {}           # IPAddr -> MAC
-        self.client_server_map = {}          # (client_ip, virtual_ip) -> server dict
+        self.client_mac_cache = {}                     # IPAddr -> MAC
+        self.client_server_map = {}                    # (client_ip, VIP) -> server
+        self.mac_to_port_map = {}                      # MAC -> port
+        self.reverse_flows_installed = set()           # (server_ip, client_ip, vip)
 
     def _handle_PacketIn(self, event):
         global server_index
 
         packet = event.parsed
         if not packet.parsed:
-            log.warning("Ignoring incomplete packet")
+            log.warning("Incomplete packet received")
             return
+
+        self.mac_to_port_map[packet.src] = event.port
 
         if packet.type == pkt.ethernet.ARP_TYPE:
             arp = packet.payload
@@ -42,14 +45,14 @@ class SDNLoadBalancer(object):
             dst_ip = arp.protodst
             src_mac = arp.hwsrc
 
-            log.info("ARP REQUEST: who-has %s tell %s", dst_ip, src_ip)
-
             if src_ip in [s["ip"] for s in SERVERS]:
-                return  # Ignore ARPs from backend servers
+                if dst_ip in self.client_mac_cache:
+                    reply_mac = self.client_mac_cache[dst_ip]
+                    self.send_arp_reply(reply_mac, src_mac, dst_ip, src_ip, event.port)
+                    log.info("Replied to ARP from server %s for client %s", src_ip, dst_ip)
+                return
 
             self.client_mac_cache[src_ip] = src_mac
-            log.info("Cached client MAC: %s → %s", src_ip, src_mac)
-
             key = (src_ip, dst_ip)
             if key not in self.client_server_map:
                 server = SERVERS[server_index]
@@ -59,113 +62,96 @@ class SDNLoadBalancer(object):
             else:
                 server = self.client_server_map[key]
 
-            # ARP reply from virtual IP to client
-            arp_reply = pkt.arp()
-            arp_reply.opcode = pkt.arp.REPLY
-            arp_reply.hwsrc = server["mac"]
-            arp_reply.hwdst = src_mac
-            arp_reply.protosrc = dst_ip
-            arp_reply.protodst = src_ip
-
-            eth = pkt.ethernet()
-            eth.type = pkt.ethernet.ARP_TYPE
-            eth.src = server["mac"]
-            eth.dst = src_mac
-            eth.payload = arp_reply
-
-            msg = of.ofp_packet_out()
-            msg.data = eth.pack()
-            msg.actions.append(of.ofp_action_output(port=event.port))
-            self.connection.send(msg)
-
-            log.info("Sent ARP reply for virtual IP %s to client %s", dst_ip, src_ip)
-            self.install_forwarding_rules(event.port, src_ip, server, event, dst_ip)
-
-        # Server ARP request for client IP
-        elif packet.type == pkt.ethernet.ARP_TYPE:
-            arp = packet.payload
-            src_ip = arp.protosrc
-            dst_ip = arp.protodst
-            src_mac = arp.hwsrc
-
-            if dst_ip in self.client_mac_cache:
-                reply_mac = self.client_mac_cache[dst_ip]
-                log.info("Replying to ARP from server for known client IP %s with MAC %s", dst_ip, reply_mac)
-
-                arp_reply = pkt.arp()
-                arp_reply.opcode = pkt.arp.REPLY
-                arp_reply.hwsrc = reply_mac
-                arp_reply.hwdst = src_mac
-                arp_reply.protosrc = dst_ip
-                arp_reply.protodst = src_ip
-
-                eth = pkt.ethernet()
-                eth.type = pkt.ethernet.ARP_TYPE
-                eth.src = reply_mac
-                eth.dst = src_mac
-                eth.payload = arp_reply
-
-                msg = of.ofp_packet_out()
-                msg.data = eth.pack()
-                msg.actions.append(of.ofp_action_output(port=event.port))
-                self.connection.send(msg)
-
-                log.info("Sent ARP reply to server %s for client %s", src_ip, dst_ip)
+            self.send_arp_reply(server["mac"], src_mac, dst_ip, src_ip, event.port)
+            log.info("Sent ARP reply: VIP %s → client %s via server %s", dst_ip, src_ip, server["ip"])
+            self.install_forwarding_rules(event.port, src_ip, server, dst_ip)
 
         elif packet.type == pkt.ethernet.IP_TYPE:
             ip_packet = packet.payload
             src_ip = ip_packet.srcip
             dst_ip = ip_packet.dstip
 
+            # Server → Client
             if src_ip in [s["ip"] for s in SERVERS]:
-                log.info("Ignoring IP packet from server IP %s", src_ip)
+                client_ip = dst_ip
+                vip_match = None
+                for (s_ip, c_ip, vip) in self.reverse_flows_installed:
+                    if s_ip == src_ip and c_ip == client_ip:
+                        vip_match = vip
+                        break
+
+                if vip_match is None:
+                    log.warning("No VIP found for server %s → client %s", src_ip, client_ip)
+                    return
+
+                ip_packet.srcip = vip_match
+                msg = of.ofp_packet_out()
+                msg.data = packet.pack()
+                msg.actions.append(of.ofp_action_output(port=self.mac_to_port(packet.dst)))
+                self.connection.send(msg)
+
+                log.info("Rewrote packet: server %s → client %s using VIP %s", src_ip, client_ip, vip_match)
                 return
 
+            # Client → VIP
             key = (src_ip, dst_ip)
             server = self.client_server_map.get(key)
             if not server:
-                log.warning("No server mapping for client %s and virtual IP %s", src_ip, dst_ip)
+                log.warning("No server assigned for client %s → VIP %s", src_ip, dst_ip)
                 return
 
-            if src_ip not in self.client_mac_cache:
-                self.client_mac_cache[src_ip] = packet.src
+            self.client_mac_cache[src_ip] = packet.src
+            self.install_forwarding_rules(event.port, src_ip, server, dst_ip)
 
-            self.install_forwarding_rules(event.port, src_ip, server, event, dst_ip)
-
-            # Rewrite and forward the first packet
             ip_packet.dstip = server["ip"]
             packet.dst = server["mac"]
 
             msg = of.ofp_packet_out()
             msg.data = packet.pack()
-            msg.actions.append(of.ofp_action_output(port=self.mac_to_port_map[server["mac"]]))
+            msg.actions.append(of.ofp_action_output(port=self.mac_to_port(server["mac"])))
             self.connection.send(msg)
-            log.info("Forwarded packet to server %s for client %s via VIP %s", server["ip"], src_ip, dst_ip)
 
-    def install_forwarding_rules(self, client_port, client_ip, server, event, virtual_ip):
-        server_port = self.mac_to_port_map[server["mac"]]
+            log.info("Forwarded client %s → server %s via VIP %s", src_ip, server["ip"], dst_ip)
+
+    def install_forwarding_rules(self, client_port, client_ip, server, vip):
+        server_port = self.mac_to_port(server["mac"])
+        triple = (server["ip"], client_ip, vip)
 
         # Client → Server
         fm1 = of.ofp_flow_mod()
         fm1.match.in_port = client_port
         fm1.match.dl_type = 0x0800
-        fm1.match.nw_dst = virtual_ip
+        fm1.match.nw_dst = vip
         fm1.actions.append(of.ofp_action_nw_addr.set_dst(server["ip"]))
         fm1.actions.append(of.ofp_action_dl_addr.set_dst(server["mac"]))
         fm1.actions.append(of.ofp_action_output(port=server_port))
         self.connection.send(fm1)
 
-        # Server → Client
-        fm2 = of.ofp_flow_mod()
-        fm2.match.in_port = server_port
-        fm2.match.dl_type = 0x0800
-        fm2.match.nw_src = server["ip"]
-        fm2.match.nw_dst = client_ip
-        fm2.actions.append(of.ofp_action_nw_addr.set_src(virtual_ip))
-        fm2.actions.append(of.ofp_action_output(port=client_port))
-        self.connection.send(fm2)
+        # Server → Client (record only, handled in controller)
+        if triple not in self.reverse_flows_installed:
+            self.reverse_flows_installed.add(triple)
+            log.info("Tracking reverse path: %s → %s via VIP %s", server["ip"], client_ip, vip)
 
-        log.info("Installed flows for %s ↔ %s via virtual IP %s", client_ip, server["ip"], virtual_ip)
+        log.info("Installed flow rules: %s ↔ %s via VIP %s", client_ip, server["ip"], vip)
+
+    def send_arp_reply(self, src_mac, dst_mac, src_ip, dst_ip, out_port):
+        arp_reply = pkt.arp()
+        arp_reply.opcode = pkt.arp.REPLY
+        arp_reply.hwsrc = src_mac
+        arp_reply.hwdst = dst_mac
+        arp_reply.protosrc = src_ip
+        arp_reply.protodst = dst_ip
+
+        eth = pkt.ethernet()
+        eth.type = pkt.ethernet.ARP_TYPE
+        eth.src = src_mac
+        eth.dst = dst_mac
+        eth.payload = arp_reply
+
+        msg = of.ofp_packet_out()
+        msg.data = eth.pack()
+        msg.actions.append(of.ofp_action_output(port=out_port))
+        self.connection.send(msg)
 
     def mac_to_port(self, mac):
         return self.mac_to_port_map.get(mac, 1)

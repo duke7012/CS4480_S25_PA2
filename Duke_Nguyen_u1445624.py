@@ -64,6 +64,8 @@ class SDNLoadBalancer(object):
             dst_ip = arp.protodst
             src_mac = arp.hwsrc
 
+            log.info("ARP request from: %s to: %s", src_ip, dst_ip)
+
             # If a server ARPs for a client (i.e., reverse direction)
             if src_ip in [s["ip"] for s in SERVERS]:
                 if dst_ip in self.client_mac_cache:
@@ -101,14 +103,11 @@ class SDNLoadBalancer(object):
             ip_packet = packet.payload
             src_ip = ip_packet.srcip
             dst_ip = ip_packet.dstip
+            log.info("ICMP request from: %s to %s", src_ip, dst_ip)
 
             key = (src_ip, dst_ip)
             server = self.client_server_map.get(key)
             if not server:
-                log.warning("No server assigned for client %s → VIP %s", src_ip, dst_ip)
-                return
-
-            vip = dst_ip  # preserve the virtual IP being used
                 log.warning("No server assigned for client %s → VIP %s", src_ip, dst_ip)
                 return
 
@@ -123,32 +122,6 @@ class SDNLoadBalancer(object):
 
             log.info("Forwarded client %s → server %s via VIP %s", src_ip, server["ip"], dst_ip)
 
-            # Manually rewrite the first ICMP reply from the server with VIP as src
-            if ip_packet.protocol == pkt.ipv4.ICMP_PROTOCOL:
-                if src_ip in self.client_mac_cache:
-                    client_mac = self.client_mac_cache[src_ip]
-                    server_mac = server["mac"]
-
-                    # Construct Ethernet and IP headers
-                    eth = pkt.ethernet()
-                    eth.src = server_mac
-                    eth.dst = client_mac
-                    eth.type = pkt.ethernet.IP_TYPE
-
-                    ip_reply = pkt.ipv4()
-                    ip_reply.protocol = pkt.ipv4.ICMP_PROTOCOL
-                    ip_reply.srcip = vip  # Use VIP from mapping
-                    ip_reply.dstip = src_ip
-                    ip_reply.payload = ip_packet.payload  # Carry the same ICMP payload
-
-                    eth.payload = ip_reply
-
-                    msg_reply = of.ofp_packet_out()
-                    msg_reply.data = eth.pack()
-                    msg_reply.actions.append(of.ofp_action_output(port=event.port))
-                    self.connection.send(msg_reply)
-
-                    log.info("Manually sent first ICMP reply from VIP %s to client %s", dst_ip, src_ip)
 
     def install_forwarding_rules(self, client_port, client_ip, server, virtual_ip):
         """

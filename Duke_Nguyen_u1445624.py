@@ -108,6 +108,10 @@ class SDNLoadBalancer(object):
                 log.warning("No server assigned for client %s → VIP %s", src_ip, dst_ip)
                 return
 
+            vip = dst_ip  # preserve the virtual IP being used
+                log.warning("No server assigned for client %s → VIP %s", src_ip, dst_ip)
+                return
+
             # Rewrite destination IP and MAC to forward to real server
             ip_packet.dstip = server["ip"]
             packet.dst = server["mac"]
@@ -118,6 +122,33 @@ class SDNLoadBalancer(object):
             self.connection.send(msg)
 
             log.info("Forwarded client %s → server %s via VIP %s", src_ip, server["ip"], dst_ip)
+
+            # Manually rewrite the first ICMP reply from the server with VIP as src
+            if ip_packet.protocol == pkt.ipv4.ICMP_PROTOCOL:
+                if src_ip in self.client_mac_cache:
+                    client_mac = self.client_mac_cache[src_ip]
+                    server_mac = server["mac"]
+
+                    # Construct Ethernet and IP headers
+                    eth = pkt.ethernet()
+                    eth.src = server_mac
+                    eth.dst = client_mac
+                    eth.type = pkt.ethernet.IP_TYPE
+
+                    ip_reply = pkt.ipv4()
+                    ip_reply.protocol = pkt.ipv4.ICMP_PROTOCOL
+                    ip_reply.srcip = vip  # Use VIP from mapping
+                    ip_reply.dstip = src_ip
+                    ip_reply.payload = ip_packet.payload  # Carry the same ICMP payload
+
+                    eth.payload = ip_reply
+
+                    msg_reply = of.ofp_packet_out()
+                    msg_reply.data = eth.pack()
+                    msg_reply.actions.append(of.ofp_action_output(port=event.port))
+                    self.connection.send(msg_reply)
+
+                    log.info("Manually sent first ICMP reply from VIP %s to client %s", dst_ip, src_ip)
 
     def install_forwarding_rules(self, client_port, client_ip, server, virtual_ip):
         """
@@ -168,7 +199,6 @@ class SDNLoadBalancer(object):
             dst_ip: The destination IP (who made the request).
             out_port: The switch port to send the reply out on.
         """
-        """Craft and send a direct ARP reply"""
         arp_reply = pkt.arp()
         arp_reply.opcode = pkt.arp.REPLY
         arp_reply.hwsrc = src_mac
@@ -198,7 +228,6 @@ class SDNLoadBalancer(object):
         Returns:
             int: The switch port number.
         """
-        """Lookup port from MAC (defaults to 1 if unknown)"""
         return self.mac_to_port_map.get(mac, 1)
 
 def launch():

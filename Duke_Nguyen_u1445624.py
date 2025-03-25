@@ -30,19 +30,14 @@ class SDNLoadBalancer(object):
         connection.addListeners(self)
         log.info("Load balancer initialized on switch %s", connection)
 
-        self.client_mac_cache = {}        # Maps client IP → MAC
-        self.client_server_map = {}       # Maps (client IP, VIP) → server
-        self.mac_to_port_map = {}         # Tracks MAC → port mappings
+        self.client_mac_cache = {}        # Maps client IP -> MAC
+        self.client_server_map = {}       # Maps (client IP, VIP) -> server
+        self.mac_to_port_map = {}         # Tracks MAC -> port mappings
 
     def _handle_PacketIn(self, event):
         """
-        Handles all incoming packets from the switch. Intercepts ARP requests
-        and IP traffic from clients:
-        - Responds to ARP requests to virtual IPs with spoofed replies using backend server MACs.
-        - Caches client MACs for future replies.
-        - Assigns backend servers using round-robin.
-        - Installs bidirectional flow rules for efficient packet handling.
-        - Rewrites destination IP/MAC of packets to transparently redirect traffic.
+        Handles all incoming packets from the switch. 
+        Intercepts ARP requests and IP traffic from clients
 
         Args:
             event: The OpenFlow event containing the incoming packet.
@@ -93,7 +88,7 @@ class SDNLoadBalancer(object):
 
             # Send spoofed ARP reply with the selected server's MAC
             self.send_arp_reply(server["mac"], src_mac, dst_ip, src_ip, event.port)
-            log.info("Sent ARP reply: VIP %s → client %s via server %s", dst_ip, src_ip, server["ip"])
+            log.info("Sent ARP reply: VIP %s -> client %s via server %s", dst_ip, src_ip, server["ip"])
 
             # Install bidirectional IP flow rules
             self.install_forwarding_rules(event.port, src_ip, server, dst_ip)
@@ -108,7 +103,7 @@ class SDNLoadBalancer(object):
             key = (src_ip, dst_ip)
             server = self.client_server_map.get(key)
             if not server:
-                log.warning("No server assigned for client %s → VIP %s", src_ip, dst_ip)
+                log.warning("No server assigned for client %s -> VIP %s", src_ip, dst_ip)
                 return
 
             # Rewrite destination IP and MAC to forward to real server
@@ -120,16 +115,13 @@ class SDNLoadBalancer(object):
             msg.actions.append(of.ofp_action_output(port=self.mac_to_port(server["mac"])))
             self.connection.send(msg)
 
-            log.info("Forwarded client %s → server %s via VIP %s", src_ip, server["ip"], dst_ip)
+            log.info("Forwarded client %s -> server %s via VIP %s", src_ip, server["ip"], dst_ip)
 
 
     def install_forwarding_rules(self, client_port, client_ip, server, virtual_ip):
         """
         Installs flow rules in the switch for traffic between a client and its
         assigned server through the virtual IP.
-
-        - Rewrites destination IP and MAC for packets from client → VIP.
-        - Rewrites source IP for packets from server → client.
 
         Args:
             client_port: Switch port the client is connected to.
@@ -139,7 +131,7 @@ class SDNLoadBalancer(object):
         """
         server_port = self.mac_to_port(server["mac"])
 
-        # Flow: Client → VIP
+        # Flow: Client -> VIP
         fm1 = of.ofp_flow_mod()
         fm1.match.in_port = client_port
         fm1.match.dl_type = pkt.ethernet.IP_TYPE
@@ -149,7 +141,7 @@ class SDNLoadBalancer(object):
         fm1.actions.append(of.ofp_action_output(port=server_port))
         self.connection.send(fm1)
 
-        # Flow: Server → Client
+        # Flow: Server -> Client
         fm2 = of.ofp_flow_mod()
         fm2.match.in_port = server_port
         fm2.match.dl_type = pkt.ethernet.IP_TYPE
@@ -159,7 +151,7 @@ class SDNLoadBalancer(object):
         fm2.actions.append(of.ofp_action_output(port=client_port))
         self.connection.send(fm2)
 
-        log.info("Installed flow rules: %s ↔ %s via VIP %s", client_ip, server["ip"], virtual_ip)
+        log.info("Installed flow rules: %s <-> %s via VIP %s", client_ip, server["ip"], virtual_ip)
 
     def send_arp_reply(self, src_mac, dst_mac, src_ip, dst_ip, out_port):
         """
